@@ -276,7 +276,7 @@ def td3(env_fn: Callable,
         epsilon_fn = get_schedule_fn(random_exploration)
 
         env, test_env = env_fn(), env_fn()
-        obs_dim = env.observation_space.shape
+        obs_dim = env.observation_space.shape[0]
         act_dim = env.action_space.shape[0]
 
         env.action_space.seed(seed)
@@ -403,6 +403,12 @@ def td3(env_fn: Callable,
         a += noise_scale * np.random.randn(act_dim)
         return np.clip(a, -act_limit, act_limit)
 
+    def observation_noise(o):
+        noise = 0.05 * np.random.randn(obs_dim)
+        noise[24:29] = [0, 0, 0, 0, 0]
+        o_n = o + noise
+        return np.clip(o_n, env.observation_space.low, env.observation_space.high)
+
     def test_agent():
         sum = 0
         for _ in range(num_test_episodes):
@@ -440,8 +446,16 @@ def td3(env_fn: Callable,
             a = get_action(o, act_noise_fn(t))
             unscaled_action = unscale_action(env.action_space, a)
         else:
-            unscaled_action = env.action_space.sample()
-            a = scale_action(env.action_space, unscaled_action)
+            if t < (start_steps/2):
+                unscaled_action = env.action_space.sample()
+                a = scale_action(env.action_space, unscaled_action)
+            else:
+                unscaled_action = np.zeros((12,))
+                a = scale_action(env.action_space, unscaled_action)
+        o_noise = observation_noise(o)
+        a_real = ac.act(torch.as_tensor(o, dtype=torch.float32))
+        a_o_noise = ac.act(torch.as_tensor(o_noise, dtype=torch.float32))
+        env.task.get_obs_noise_action (a_real, a_o_noise)
         # Step the env
         o2, r, d, _ = env.step(unscaled_action)
         ep_ret += r
