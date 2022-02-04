@@ -32,7 +32,7 @@ def unscale_action(action_space, scaled_action):
     :param scaled_action: (np.ndarray)
     :return: (np.ndarray)
     """
-    low, high = action_space.low, action_space.high
+    low, high = torch.as_tensor(action_space.low,dtype=torch.float32,device=torch.device('cuda')), torch.as_tensor(action_space.high,dtype=torch.float32,device=torch.device('cuda'))
     return low + (0.5 * (scaled_action + 1.0) * (high - low))
 
 def scale_obs(obs_space, obs):
@@ -77,7 +77,10 @@ class ReplayBuffer:
     def store(self, obs, act, rew, next_obs, done):
         self.obs_buf[self.ptr] = obs
         self.obs2_buf[self.ptr] = next_obs
-        self.act_buf[self.ptr] = act
+        if type(act) == torch.Tensor:
+            self.act_buf[self.ptr] = np.array(act.tolist(), dtype=np.float32)
+        else:
+            self.act_buf[self.ptr] = act
         self.rew_buf[self.ptr] = rew
         self.done_buf[self.ptr] = done
         self.ptr = (self.ptr + 1) % self.max_size
@@ -361,8 +364,8 @@ def td3(env_fn: Callable,
         loss_q = loss_q1 + loss_q2
 
         # Useful info for logging
-        loss_info = dict(Q1Vals=q1.detach().numpy(),
-                         Q2Vals=q2.detach().numpy())
+        loss_info = dict(Q1Vals=q1.detach(),
+                         Q2Vals=q2.detach())
 
         return loss_q, loss_info
 
@@ -379,10 +382,13 @@ def td3(env_fn: Callable,
         # First run one gradient descent step for Q1 and Q2
         q_optimizer.zero_grad()
         loss_q, loss_info = compute_loss_q(data)
+        if type(loss_info['Q1Vals'])==torch.Tensor:
+            loss_info['Q1Vals']=np.array(loss_info['Q1Vals'].tolist())  
+            loss_info['Q2Vals']=np.array(loss_info['Q2Vals'].tolist()) 
         loss_q.backward()
         q_optimizer.step()
         # Record things
-        logger.store(LossQ=loss_q.item(), **loss_info)
+        logger.store(LossQ=loss_q.item(), **loss_info)  #np.array(loss_info['Q2Vals'].tolist())  
 
         # Possibly update pi and target networks
         if timer % policy_delay == 0:
@@ -415,8 +421,8 @@ def td3(env_fn: Callable,
 
     def get_action(o, noise_scale):
         a = ac.act(torch.as_tensor(o, dtype=torch.float32,device=torch.device('cuda')))
-        a += noise_scale * np.random.randn(act_dim)
-        return np.clip(a, -act_limit, act_limit)
+        a += torch.as_tensor((noise_scale * np.random.randn(act_dim)),dtype=torch.float32,device=torch.device('cuda'))
+        return torch.clamp(a,-act_limit, act_limit)
 
     def test_agent():
         sum = 0
@@ -478,7 +484,7 @@ def td3(env_fn: Callable,
         d = False if ep_len == max_ep_len else d
 
         # Store experience to replay buffer
-        replay_buffer.store(o, a, r, o2, d)
+        replay_buffer.store(o, np.array(a.tolist()), r, o2, d)
 
         # Super critical, easy to overlook step: make sure to update 
         # most recent observation!
@@ -518,8 +524,8 @@ def td3(env_fn: Callable,
             logger.log_tabular('EpLen', average_only=True)
             logger.log_tabular('TestEpLen', average_only=True)
             logger.log_tabular('TotalEnvInteracts', t)
-            logger.log_tabular('Q1Vals', with_min_and_max=True)
-            logger.log_tabular('Q2Vals', with_min_and_max=True)
+            #logger.log_tabular('Q1Vals', with_min_and_max=True)
+            #logger.log_tabular('Q2Vals', with_min_and_max=True)
             logger.log_tabular('LossPi', average_only=True)
             logger.log_tabular('LossQ', average_only=True)
             logger.log_tabular('Time', time.time() - start_time)
