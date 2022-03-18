@@ -101,11 +101,17 @@ def load_pytorch_policy(fpath, itr, deterministic=False):
     model = torch.load(fname)
 
     # make function for producing an action given a single state
-    def get_action(x):
+    def get_action(x): #GPU
         with torch.no_grad():
-            x = torch.as_tensor(x, dtype=torch.float32)
+            x = torch.as_tensor(x, dtype=torch.float32, device=torch.device('cuda'))
             action = model.act(x)
         return action
+
+    # def get_action(x):  #CPU
+    #     with torch.no_grad():
+    #         x = torch.as_tensor(x, dtype=torch.float32)
+    #         action = model.act(x)
+    #     return action        
 
     return get_action
 
@@ -125,6 +131,8 @@ def run_policy(env, get_action, max_ep_len=None, num_episodes=100, render=True):
         :return: (np.ndarray)
         """
         low, high = action_space.low, action_space.high
+        # if type(scaled_action)==torch.Tensor:
+        #     scaled_action=scaled_action.cpu().numpy()
         return low + (0.5 * (scaled_action + 1.0) * (high - low))
 
     logger = EpochLogger()
@@ -134,10 +142,12 @@ def run_policy(env, get_action, max_ep_len=None, num_episodes=100, render=True):
             env.render()
             time.sleep(1e-3)
         #q_lr =0 #extra
-        #explo =0  #extra
+        explo =0  #extra
         a = get_action(o)
+        if type(a)==torch.Tensor:
+            a=a.detach().cpu().numpy()
         unscaled_action = unscale_action(env.action_space, a)
-        o, r, d, _ = env.step(unscaled_action) #,q_lr,explo
+        o, r, d, _ = env.step(unscaled_action, explo) #,q_lr,explo
         #time.sleep(0.1)
         ep_ret += r
         ep_len += 1

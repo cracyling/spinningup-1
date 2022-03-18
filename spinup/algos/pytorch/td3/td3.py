@@ -5,13 +5,15 @@ import itertools
 import numpy as np
 import torch
 from torch.optim import Adam
-from torch.optim import SGD
 from typing import Dict, Union, Callable
 import time
 import spinup.algos.pytorch.td3.core as core
 from spinup.utils.logx import EpochLogger
 from spinup.utils.torch_algo_utils import update_learning_rate, get_schedule_fn
 import glob
+import gc 
+
+computation_mode =1
 
 def scale_action(action_space, action):
     """
@@ -32,7 +34,11 @@ def unscale_action(action_space, scaled_action):
     :param scaled_action: (np.ndarray)
     :return: (np.ndarray)
     """
-    low, high = torch.as_tensor(action_space.low,dtype=torch.float32,device=torch.device('cuda')), torch.as_tensor(action_space.high,dtype=torch.float32,device=torch.device('cuda'))
+    global computation_mode 
+    low, high = action_space.low, action_space.high
+    if computation_mode==2:
+        low, high = torch.as_tensor(action_space.low,dtype=torch.float32,device=torch.device('cuda')), torch.as_tensor(action_space.high,dtype=torch.float32,device=torch.device('cuda'))
+
     return low + (0.5 * (scaled_action + 1.0) * (high - low))
 
 def scale_obs(obs_space, obs):
@@ -65,7 +71,7 @@ class ReplayBuffer:
     """
     A simple FIFO experience replay buffer for TD3 agents.
     """
-
+    global computation_mode 
     def __init__(self, obs_dim, act_dim, size):
         self.obs_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
         self.obs2_buf = np.zeros(core.combined_shape(size, obs_dim), dtype=np.float32)
@@ -77,10 +83,15 @@ class ReplayBuffer:
     def store(self, obs, act, rew, next_obs, done):
         self.obs_buf[self.ptr] = obs
         self.obs2_buf[self.ptr] = next_obs
-        if type(act) == torch.Tensor:
-            self.act_buf[self.ptr] = np.array(act.tolist(), dtype=np.float32)
+        self.act_buf[self.ptr] = act
+        if computation_mode==2:
+            if type(act) == torch.Tensor:
+                self.act_buf[self.ptr] = np.array(act.detach().cpu().numpy(), dtype=np.float32)
+            else:
+                self.act_buf[self.ptr] = act
         else:
             self.act_buf[self.ptr] = act
+ 
         self.rew_buf[self.ptr] = rew
         self.done_buf[self.ptr] = done
         self.ptr = (self.ptr + 1) % self.max_size
@@ -93,10 +104,11 @@ class ReplayBuffer:
                      act=self.act_buf[idxs],
                      rew=self.rew_buf[idxs],
                      done=self.done_buf[idxs]) 
-        return {k: torch.as_tensor(v, dtype=torch.float32,device=torch.device('cuda')) for k, v in batch.items()}#torch.as_tensor([0,0,0], device=torch.device('cuda')
+        if computation_mode==2:
+            return {k: torch.as_tensor(v, dtype=torch.float32,device=torch.device('cuda')) for k, v in batch.items()}#torch.as_tensor([0,0,0], device=torch.device('cuda')
 
-
-
+        else:
+            return {k: torch.as_tensor(v, dtype=torch.float32) for k, v in batch.items()}#torch.as_tensor([0,0,0], device=torch.device('cuda')
 def td3(env_fn: Callable,
         actor_critic: torch.nn.Module = core.MLPActorCritic,
         ac_kwargs: Dict = None,
@@ -119,11 +131,19 @@ def td3(env_fn: Callable,
         num_test_episodes: int = 1,
         max_ep_len: int = 1000,
         logger_kwargs: Dict = None,
-        save_freq: int = 1,
+        #save_freq: int = 50,  #default 1
+        save_freq_by_epoch : int = 10,
+        save_freq_reward: int = 2,
         random_exploration: Union[Callable, float] = 0.0,
         save_checkpoint_path: str = None,
         load_checkpoint_path: str = None,
-        load_model_file: str = None):
+        load_model_file: str = None,
+        resume_randomness:bool = False,
+        resume_randomness_timestep:int = 400000,
+        record_threshold: int =0,
+        compute_mode: int = 1):
+    global computation_mode 
+    computation_mode =compute_mode
     """
     Twin Delayed Deep Deterministic Policy Gradient (TD3)
 
@@ -228,6 +248,14 @@ def td3(env_fn: Callable,
 
         load_checkpoint_path (str): Path to load the model. Cannot be set if
             save_model_path is set.
+        resume_randomness (bool): Switch on and off randomness after certain timestep. True : on randomness,
+            False: off randomness
+
+        resume_randomness_timestep (int) : Specify which timestep to resume randomness if you true on randomness
+
+        record_threshold (int): To enable recording of threshold value for random exploration. 0= off  , 1 = on
+
+        compute_mode (int): Computing using cpu or gpu. 1 = cpu  2 = gpu
     """
     if logger_kwargs is None:
         logger_kwargs = dict()
@@ -364,8 +392,12 @@ def td3(env_fn: Callable,
         loss_q = loss_q1 + loss_q2
 
         # Useful info for logging
-        loss_info = dict(Q1Vals=q1.detach(),
-                         Q2Vals=q2.detach())
+        if computation_mode==1:
+            loss_info = dict(Q1Vals=q1.detach().numpy(),
+                            Q2Vals=q2.detach().numpy())
+        elif computation_mode==2:
+            loss_info = dict(Q1Vals=q1.detach().cpu().numpy(),
+                         Q2Vals=q2.detach().cpu().numpy())
 
         return loss_q, loss_info
 
@@ -382,13 +414,10 @@ def td3(env_fn: Callable,
         # First run one gradient descent step for Q1 and Q2
         q_optimizer.zero_grad()
         loss_q, loss_info = compute_loss_q(data)
-        if type(loss_info['Q1Vals'])==torch.Tensor:
-            loss_info['Q1Vals']=np.array(loss_info['Q1Vals'].tolist())  
-            loss_info['Q2Vals']=np.array(loss_info['Q2Vals'].tolist()) 
         loss_q.backward()
         q_optimizer.step()
         # Record things
-        logger.store(LossQ=loss_q.item(), **loss_info)  #np.array(loss_info['Q2Vals'].tolist())  
+        logger.store(LossQ=loss_q.item(), **loss_info)
 
         # Possibly update pi and target networks
         if timer % policy_delay == 0:
@@ -420,9 +449,14 @@ def td3(env_fn: Callable,
                     p_targ.data.add_((1 - polyak) * p.data)
 
     def get_action(o, noise_scale):
-        a = ac.act(torch.as_tensor(o, dtype=torch.float32,device=torch.device('cuda')))
-        a += torch.as_tensor((noise_scale * np.random.randn(act_dim)),dtype=torch.float32,device=torch.device('cuda'))
-        return torch.clamp(a,-act_limit, act_limit)
+        if computation_mode==1:
+            a = ac.act(torch.as_tensor(o, dtype=torch.float32))
+            a += noise_scale * np.random.randn(act_dim)
+            return np.clip(a, -act_limit, act_limit)
+        elif computation_mode==2:
+            a = ac.act(torch.as_tensor(o, dtype=torch.float32,device=torch.device('cuda')))
+            a += torch.as_tensor((noise_scale * np.random.randn(act_dim)),dtype=torch.float32,device=torch.device('cuda'))
+            return torch.clamp(a,-act_limit, act_limit)
 
     def test_agent():
         sum = 0
@@ -432,8 +466,8 @@ def td3(env_fn: Callable,
             #test_env.render()
             while not (d or (ep_len == max_ep_len)):
                 # Take deterministic actions at test time (noise_scale=0)
-                scaled_action = get_action(o, 0)
-                o, r, d, _ = test_env.step(unscale_action(env.action_space, scaled_action),threshold3 )#,q_lr, explo
+                a = get_action(o, 0)
+                o, r, d, _ = test_env.step(unscale_action(env.action_space, a),threshold3 )#,q_lr, explo
                 ep_ret += r
                 ep_len += 1
             logger.store(TestEpRet=ep_ret, TestEpLen=ep_len)
@@ -444,18 +478,21 @@ def td3(env_fn: Callable,
     # Prepare for interaction with environment
     total_steps = steps_per_epoch * epochs
     start_time = time.time()
-    highest_test_reward = 0
+    highest_test_reward = -200
     threshold2 = 0.9
     i22=0
     if loaded_state_dict is not None:
         o = loaded_state_dict['o']
         ep_ret = loaded_state_dict['ep_ret']
         ep_len = loaded_state_dict['ep_len']
+        if record_threshold==1:
+            threshold2 = loaded_state_dict['threshold2']
+            i22 = loaded_state_dict['i22']
         highest_test_reward = loaded_state_dict['highest_test_reward']
     else:
         o, ep_ret, ep_len = env.reset(), 0, 0
     # Main loop: collect experience in env and update/log each epoch
-    #env.render()
+    # env.render()
     
     for t in range(total_steps):
         t += t_ori
@@ -471,8 +508,27 @@ def td3(env_fn: Callable,
             unscaled_action = env.action_space.sample()
             a = scale_action(env.action_space, unscaled_action)
             
-        threshold3=epsilon_fn(t)          
-        
+        threshold3=epsilon_fn(t)
+        if resume_randomness == True:
+            if t > resume_randomness_timestep :
+                i22+=1
+                if (i22 % 1000) < 1: 
+                    if threshold2 <= 0.3:
+                        threshold2 -= 0.005
+                    else:
+                        threshold2 -= 0.02 
+                if threshold2 < 0.01:
+                    threshold2 = 0.01
+                    
+                if np.random.rand() > threshold2:
+                    a = get_action(o, act_noise_fn(i22))
+                    unscaled_action = unscale_action(env.action_space, a)
+                else:
+                    unscaled_action = env.action_space.sample()
+                    a = scale_action(env.action_space, unscaled_action)
+
+                threshold3 = threshold2 
+
         # Step the env
         o2, r, d, _ = env.step(unscaled_action,threshold3)#,threshold2)
         ep_ret += r
@@ -484,7 +540,7 @@ def td3(env_fn: Callable,
         d = False if ep_len == max_ep_len else d
 
         # Store experience to replay buffer
-        replay_buffer.store(o, np.array(a.tolist()), r, o2, d)
+        replay_buffer.store(o, a, r, o2, d)
 
         # Super critical, easy to overlook step: make sure to update 
         # most recent observation!
@@ -494,11 +550,13 @@ def td3(env_fn: Callable,
         if d or (ep_len == max_ep_len):
             logger.store(EpRet=ep_ret, EpLen=ep_len)
             o, ep_ret, ep_len = env.reset(), 0, 0
+            gc.collect()  # Every episode doing Gabbage collect to clean
 
         # Early stop if cum_reward lower than -500
         elif ep_ret < -300:
             logger.store(EpRet=ep_ret, EpLen=ep_len)
             o, ep_ret, ep_len = env.reset(), 0, 0
+            gc.collect() # Every episode doing Gabbage collect to clean
             
         # Update handling
         if t >= update_after and t % update_every == 0:  # each step, 1000 
@@ -524,8 +582,8 @@ def td3(env_fn: Callable,
             logger.log_tabular('EpLen', average_only=True)
             logger.log_tabular('TestEpLen', average_only=True)
             logger.log_tabular('TotalEnvInteracts', t)
-            #logger.log_tabular('Q1Vals', with_min_and_max=True)
-            #logger.log_tabular('Q2Vals', with_min_and_max=True)
+            logger.log_tabular('Q1Vals', with_min_and_max=True)
+            logger.log_tabular('Q2Vals', with_min_and_max=True)
             logger.log_tabular('LossPi', average_only=True)
             logger.log_tabular('LossQ', average_only=True)
             logger.log_tabular('Time', time.time() - start_time)
@@ -540,38 +598,39 @@ def td3(env_fn: Callable,
             if load_checkpoint_path is not None:
                 save_checkpoint = True
                 checkpoint_path = load_checkpoint_path
-            if (epoch % save_freq == 0) or (epoch == epochs):
+            if (epoch % save_freq_reward == 0) or (epoch == epochs):
                 if average_test > highest_test_reward:
                     logger.save_state({}, None)
                     print('Saved highest reward model!')
                     #time.sleep(2.0)
                     highest_test_reward = average_test
 
-                if save_checkpoint:
-                    checkpoint_file = os.path.join(checkpoint_path, f'save_{epoch}.pt')
-                    torch.save({'ac': ac.state_dict(),
-                                'ac_targ': ac_targ.state_dict(),
-                                'replay_buffer': replay_buffer,
-                                'pi_optimizer': pi_optimizer.state_dict(),
-                                'q_optimizer': q_optimizer.state_dict(),
-                                'logger_epoch_dict': logger.epoch_dict,
-                                'q_learning_rate_fn': q_learning_rate_fn,
-                                'pi_learning_rate_fn': pi_learning_rate_fn,
-                                'epsilon_fn': epsilon_fn,
-                                'act_noise_fn': act_noise_fn,
-                                'torch_rng_state': torch.get_rng_state(),
-                                'np_rng_state': np.random.get_state(),
-                                'action_space_state': env.action_space.np_random.get_state(),
-                                #'env': env,
-                                #'test_env': test_env,
-                                'ep_ret': ep_ret,
-                                'ep_len': ep_len,
-                                'threshold2' : threshold2,
-                                'i22' : i22,
-                                'o': o,
-                                'highest_test_reward': highest_test_reward,
-                                't': t+1}, checkpoint_file)
-                    delete_old_files(checkpoint_path, 2)
+            if save_checkpoint and epoch % save_freq_by_epoch == 0:
+                checkpoint_file = os.path.join(checkpoint_path, f'save_{epoch}.pt')
+                torch.save({'ac': ac.state_dict(),
+                            'ac_targ': ac_targ.state_dict(),
+                            'replay_buffer': replay_buffer,
+                            'pi_optimizer': pi_optimizer.state_dict(),
+                            'q_optimizer': q_optimizer.state_dict(),
+                            'logger_epoch_dict': logger.epoch_dict,
+                            'q_learning_rate_fn': q_learning_rate_fn,
+                            'pi_learning_rate_fn': pi_learning_rate_fn,
+                            'epsilon_fn': epsilon_fn,
+                            'act_noise_fn': act_noise_fn,
+                            'torch_rng_state': torch.get_rng_state(),
+                            'np_rng_state': np.random.get_state(),
+                            'action_space_state': env.action_space.np_random.get_state(),
+                            #'env': env,
+                            #'test_env': test_env,
+                            'ep_ret': ep_ret,
+                            'ep_len': ep_len,
+                            'threshold2' : threshold2,
+                            'i22' : i22,
+                            'o': o,
+                            'highest_test_reward': highest_test_reward,
+                            't': t+1}, checkpoint_file)
+                delete_old_files(checkpoint_path, 2)
+                gc.collect()
 
 
 if __name__ == '__main__':
